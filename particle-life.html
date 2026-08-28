@@ -301,6 +301,10 @@
     </div>
 
     <div id="legend"></div>
+    <div>
+      <input type="checkbox" id="decayToggle" unchecked>
+      <label for="decayToggle">Enable particle decay</label>
+    </div>
   </div>
 
   <div id="unsupported" style="display:none">
@@ -319,28 +323,7 @@
     // Dynamic Palette Generation (HSL spaced around color wheel)
     let typeColors = [];
     let typeMasses = [];
-
-    function generatePaletteAndMasses(count) {
-      typeColors = [];
-      typeMasses = [];
-      for (let i = 0; i < count; i++) {
-        const hue = (i * (360 / count)) % 360;
-        // HSL to RGB conversion helper
-        const c = 0.85, x = c * (1 - Math.abs((hue / 60) % 2 - 1));
-        let r = 0, g = 0, b = 0;
-        if (hue < 60) { r = c; g = x; }
-        else if (hue < 120) { r = x; g = c; }
-        else if (hue < 180) { g = c; b = x; }
-        else if (hue < 240) { g = x; b = c; }
-        else if (hue < 300) { r = x; b = c; }
-        else { r = c; b = x; }
-        const m = 0.15;
-        typeColors.push([r + m, g + m, b + m]);
-        const randomMass = 0.5 + Math.random() * 9.5;
-        typeMasses.push(parseFloat(randomMass.toFixed(2)));
-      }
-    }
-    generatePaletteAndMasses(numTypes);
+    let typeDecayRates = []; // λ values per type (0 = stable)
 
     const canvas = document.getElementById('gpuCanvas');
 
@@ -375,7 +358,7 @@
       pos: vec2f,
       vel: vec2f,
       ptype: f32,
-      _pad: f32, // Padding to maintain 16-byte alignment (Vector4 byte equivalent)
+      lifetime: f32, // Time left (in seconds) before this particle decays
     };
 
     struct Params {
@@ -387,12 +370,17 @@
       forceScale: f32,
       numParticles: f32,
       numTypes: f32,
+      seed: f32,
+      enableDecay: f32, // 1.0 = active decay, 0.0 = decay disabled
+      _pad1: f32,
+      _pad2: f32,
     };
 
     @group(0) @binding(0) var<storage, read_write> particles: array<Particle>;
     @group(0) @binding(1) var<uniform> params: Params;
     @group(0) @binding(2) var<storage, read> matrix: array<f32>;
     @group(0) @binding(3) var<storage, read> masses: array<f32>;
+    @group(0) @binding(4) var<storage, read> decayRates: array<f32>;
 
      /**
      * Calculates half-linear particle interactions:
@@ -481,6 +469,49 @@
       @location(1) color: vec3f,
     };
 
+    // Extremely fast, stateless 32-bit integer hash for uniform [0, 1) floats
+    fn hashFloat(seed: u32) -> f32 {
+      var state = seed * 747796405u + 2891336453u;
+      var word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+      word = (word >> 22u) ^ word;
+      return f32(word) / 4294967296.0;
+    }
+
+    @compute @workgroup_size(64)
+    fn updateDecay(@builtin(global_invocation_id) gid: vec3u) {
+      // If decay is globally toggled off, exit immediately
+      if (params.enableDecay < 0.5) { return; }  
+
+      let i = gid.x;
+      if (i >= u32(params.numParticles)) { return; }
+
+      let pType = u32(particles[i].ptype);
+      
+      // Ground state (0) is stable
+      if (pType == 0u) { return; }
+
+      // Decrement lifetime remaining
+      var tLeft = particles[i].lifetime - params.dt;
+
+      if (tLeft <= 0.0) {
+        // 1. Decay down to lower energy state
+        let nextType = pType - 1u;
+        particles[i].ptype = f32(nextType);
+
+        // 2. Roll next lifetime for the new state if it's still unstable
+        if (nextType > 0u) {
+          let lambda = decayRates[nextType];
+          // Seed using global invocation ID and uniform seed step
+          let u = clamp(hashFloat(i + u32(params.seed)), 1e-6, 0.999999);
+          tLeft = -log(1.0 - u) / lambda;
+        } else {
+          tLeft = 1e9; // Ground state lives forever
+        }
+      }
+
+      particles[i].lifetime = tLeft;
+    }
+
     @group(0) @binding(0) var<storage, read> rParticles: array<Particle>;
     @group(0) @binding(1) var<uniform> rParams: Params;
     @group(0) @binding(2) var<storage, read> colors: array<vec4f>;
@@ -497,7 +528,7 @@
 
       const MIN_RADIUS: f32 = 1.5;
       const MAX_RADIUS: f32 = 10.0;
-      const MIN_MASS: f32 = 0.5; // TODO: extract these and use in mass randomization instead of hard-coding three times
+      const MIN_MASS: f32 = 0.5;
       const MAX_MASS: f32 = 10.0;
 
       let typeIdx = u32(p.ptype);
@@ -539,8 +570,9 @@
       let colorData, colorBuffer;
       let massData, massBuffer;
       let computeBindGroup, renderBindGroup;
+      let decayRates, decayBuffer;
 
-      const paramsData = new Float32Array(8);
+      const paramsData = new Float32Array(12);
       const paramsBuffer = device.createBuffer({
         size: paramsData.byteLength,
         usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
@@ -553,6 +585,7 @@
           { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
           { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
           { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+          { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
         ]
       });
       const renderBGL = device.createBindGroupLayout({
@@ -573,6 +606,10 @@
         layout: device.createPipelineLayout({ bindGroupLayouts: [computeBGL] }),
         compute: { module: shaderModule, entryPoint: 'updatePosition' }
       });
+      const decayPipeline = device.createComputePipeline({
+        layout: device.createPipelineLayout({ bindGroupLayouts: [computeBGL] }),
+        compute: { module: shaderModule, entryPoint: 'updateDecay' }
+      });
       const renderPipeline = device.createRenderPipeline({
         layout: device.createPipelineLayout({ bindGroupLayouts: [renderBGL] }),
         vertex: { module: shaderModule, entryPoint: 'vs' },
@@ -589,6 +626,71 @@
         primitive: { topology: 'triangle-list' },
       });
 
+      // Helper function to sort and sync mass hierarchy
+      function sortAndSyncMassHierarchy(raw) {
+        // 1. Re-sort by mass ascending
+        raw.sort((a, b) => a.mass - b.mass);
+        typeColors = raw.map(item => item.color);
+        typeMasses = raw.map(item => item.mass);
+
+        // 2. Recalculate Decay Rates (λ)
+        typeDecayRates = [];
+        const minMass = typeMasses[0];
+        const maxMass = typeMasses[numTypes - 1];
+
+        for (let i = 0; i < numTypes; i++) {
+          if (i === 0 || maxMass === minMass) {
+            typeDecayRates.push(0.0);
+          } else {
+            const normExcess = (typeMasses[i] - minMass) / (maxMass - minMass);
+            const lambda = 0.005 + normExcess * 0.045;
+            typeDecayRates.push(lambda);
+          }
+        }
+
+        // 3. Only sync to GPU if buffers have been allocated
+        if (massBuffer && colorBuffer && decayBuffer) {
+          typeMasses.forEach((m, i) => { massData[i] = m; });
+          typeColors.forEach((c, i) => {
+            colorData[i * 4 + 0] = c[0];
+            colorData[i * 4 + 1] = c[1];
+            colorData[i * 4 + 2] = c[2];
+            colorData[i * 4 + 3] = 1.0;
+          });
+          typeDecayRates.forEach((r, i) => { decayRates[i] = r; });
+
+          device.queue.writeBuffer(massBuffer, 0, massData);
+          device.queue.writeBuffer(colorBuffer, 0, colorData);
+          device.queue.writeBuffer(decayBuffer, 0, decayRates);
+        }
+      }
+
+      function generatePaletteAndMasses(count) {
+        let raw = [];
+        for (let i = 0; i < count; i++) {
+          const hue = (i * (360 / count)) % 360;
+          const c = 0.85, x = c * (1 - Math.abs((hue / 60) % 2 - 1));
+          let r = 0, g = 0, b = 0;
+          if (hue < 60) { r = c; g = x; }
+          else if (hue < 120) { r = x; g = c; }
+          else if (hue < 180) { g = c; b = x; }
+          else if (hue < 240) { g = x; b = c; }
+          else if (hue < 300) { r = x; b = c; }
+          else { r = c; b = x; }
+          const m = 0.15;
+          const randomMass = 0.5 + Math.random() * 9.5;
+          raw.push({ color: [r + m, g + m, b + m], mass: parseFloat(randomMass.toFixed(2)) });
+        }
+        sortAndSyncMassHierarchy(raw);
+      }
+
+      // Function to sample lifetime from Exponential Distribution: T = -ln(1 - U) / λ
+      function sampleLifetime(lambda) {
+        if (lambda <= 0) return 1e9; // Ground state / stable particles live effectively forever
+        const u = Math.random();
+        return -Math.log(1 - u) / lambda;
+      }
+
       /**
        * Initializes or recreates GPU memory buffers based on current numTypes and perType
        */
@@ -600,13 +702,14 @@
         particleData = new Float32Array(numParticles * 6); // 6 floats per struct (pos, vel, type, pad)
         for (let i = 0; i < numParticles; i++) {
           const type = i % numTypes;
+          const lambda = typeDecayRates[type];  // Poisson decay rate for this particle type
           const o = i * 6;
           particleData[o + 0] = Math.random() * canvas.width;
           particleData[o + 1] = Math.random() * canvas.height;
           particleData[o + 2] = 0; // vel x
           particleData[o + 3] = 0; // vel y
           particleData[o + 4] = type;
-          particleData[o + 5] = 0; // padding
+          particleData[o + 5] = sampleLifetime(lambda); // Initial pre-rolled lifetime
         }
 
         if (particleBuffer) particleBuffer.destroy();
@@ -646,13 +749,24 @@
         // Ensure massData float array length is padded to a multiple of 4 (16 bytes)
         const paddedTypeCount = Math.ceil(numTypes / 4) * 4;
         massData = new Float32Array(paddedTypeCount);
+        decayRates = new Float32Array(paddedTypeCount);
+
         typeMasses.forEach((m, i) => { massData[i] = m; });
+        typeDecayRates.forEach((r, i) => { decayRates[i] = r; });
+
         if (massBuffer) massBuffer.destroy();
         massBuffer = device.createBuffer({
           size: massData.byteLength,
           usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
         });
         device.queue.writeBuffer(massBuffer, 0, massData);
+
+        if (decayBuffer) decayBuffer.destroy();
+        decayBuffer = device.createBuffer({
+          size: decayRates.byteLength,
+          usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+        });
+        device.queue.writeBuffer(decayBuffer, 0, decayRates);
 
         // 4. Re-bind GPU resources to Bind Groups
         computeBindGroup = device.createBindGroup({
@@ -662,6 +776,7 @@
             { binding: 1, resource: { buffer: paramsBuffer } },
             { binding: 2, resource: { buffer: matrixBuffer } },
             { binding: 3, resource: { buffer: massBuffer } },
+            { binding: 4, resource: { buffer: decayBuffer } },
           ]
         });
         renderBindGroup = device.createBindGroup({
@@ -690,12 +805,18 @@
       }
 
       function randomizeMasses() {
+        let raw = [];
         for (let i = 0; i < numTypes; i++) {
           const randomMass = 0.5 + Math.random() * 9.5;
-          typeMasses[i] = parseFloat(randomMass.toFixed(2));
-          massData[i] = typeMasses[i];
+          raw.push({
+            color: typeColors[i],
+            mass: parseFloat(randomMass.toFixed(2))
+          });
         }
-        device.queue.writeBuffer(massBuffer, 0, massData);
+
+        sortAndSyncMassHierarchy(raw);
+
+        renderMatrixUI();
         renderLegendUI();
       }
 
@@ -708,10 +829,8 @@
         grid.style.gridTemplateColumns = `16px repeat(${numTypes}, 1fr)`;
         const labelColors = typeColors.map(c => `rgb(${c[0] * 255 | 0},${c[1] * 255 | 0},${c[2] * 255 | 0})`);
 
-        // Top-left empty header cell
         grid.appendChild(Object.assign(document.createElement('div'), { className: 'corner' }));
 
-        // Column header swatches
         for (let c = 0; c < numTypes; c++) {
           const sw = document.createElement('div');
           sw.className = 'swatch';
@@ -719,7 +838,6 @@
           grid.appendChild(sw);
         }
 
-        // Rows (Row type acting on Column type)
         for (let r = 0; r < numTypes; r++) {
           const sw = document.createElement('div');
           sw.className = 'swatch';
@@ -756,7 +874,6 @@
       // --- Dynamic Sliders & Control Input Listeners ---
       const state = { rMax: 30, forceScale: 1.0, friction: 0.95, paused: false };
 
-      // 1. Number of Particle Types Slider (1-10)
       const numTypesEl = document.getElementById('numTypes');
       const numTypesVal = document.getElementById('numTypesVal');
       numTypesEl.addEventListener('input', () => {
@@ -765,7 +882,6 @@
         rebuildBuffers();
       });
 
-      // 2. Particles per Type Slider (1000-5000)
       const perTypeEl = document.getElementById('perType');
       const perTypeVal = document.getElementById('perTypeVal');
       perTypeEl.addEventListener('input', () => {
@@ -774,7 +890,6 @@
         rebuildBuffers();
       });
 
-      // Standard Physics Controls
       const rMaxEl = document.getElementById('rMax');
       const rMaxVal = document.getElementById('rMaxVal');
       rMaxEl.addEventListener('input', () => { state.rMax = +rMaxEl.value; rMaxVal.textContent = state.rMax; });
@@ -786,6 +901,14 @@
       const frictionEl = document.getElementById('friction');
       const frictionVal = document.getElementById('frictionVal');
       frictionEl.addEventListener('input', () => { state.friction = +frictionEl.value / 100; frictionVal.textContent = state.friction.toFixed(2); });
+
+      // Decay toggle listener
+      const decayToggleEl = document.getElementById('decayToggle');
+      if (decayToggleEl) {
+        decayToggleEl.addEventListener('change', () => {
+          state.enableDecay = decayToggleEl.checked;
+        });
+      }
 
       document.getElementById('btnMatrix').addEventListener('click', randomizeMatrix);
       document.getElementById('btnMasses').addEventListener('click', randomizeMasses);
@@ -826,30 +949,31 @@
         }
 
         if (!state.paused) {
-          // Update Uniform parameters
           paramsData[0] = canvas.width;
           paramsData[1] = canvas.height;
-          paramsData[2] = state.rMax * (canvas.width / (canvas.clientWidth || canvas.width)); // Scale viewport pixels
-          paramsData[3] = 1.0;
+          paramsData[2] = state.rMax * (canvas.width / (canvas.clientWidth || canvas.width));
+          paramsData[3] = 5 * dt;
           paramsData[4] = state.friction;
           paramsData[5] = state.forceScale;
           paramsData[6] = numParticles;
           paramsData[7] = numTypes;
+          paramsData[8] = Math.random() * 10000.0;
+          paramsData[9] = state.enableDecay ? 1.0 : 0.0;
           device.queue.writeBuffer(paramsBuffer, 0, paramsData);
 
           const encoder = device.createCommandEncoder();
           const workgroups = Math.ceil(numParticles / 64);
 
-          // --- Compute Pass: Physics Calculation ---
           const cpass = encoder.beginComputePass();
           cpass.setBindGroup(0, computeBindGroup);
           cpass.setPipeline(velPipeline);
           cpass.dispatchWorkgroups(workgroups);
           cpass.setPipeline(posPipeline);
           cpass.dispatchWorkgroups(workgroups);
+          cpass.setPipeline(decayPipeline);
+          cpass.dispatchWorkgroups(workgroups);
           cpass.end();
 
-          // --- Render Pass: Drawing Particles to Screen ---
           const view = context.getCurrentTexture().createView();
           const rpass = encoder.beginRenderPass({
             colorAttachments: [{
@@ -861,7 +985,7 @@
           });
           rpass.setPipeline(renderPipeline);
           rpass.setBindGroup(0, renderBindGroup);
-          rpass.draw(6, numParticles); // 6 vertices per particle quad instance
+          rpass.draw(6, numParticles);
           rpass.end();
 
           device.queue.submit([encoder.finish()]);
@@ -874,6 +998,3 @@
 
     main();
   </script>
-</body>
-
-</html>
