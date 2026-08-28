@@ -162,7 +162,6 @@
     #matrixWrap {
       margin-top: 14px;
       min-height: 320px;
-      /* Reserves space for the maximum 10x10 matrix */
     }
 
     #matrixWrap .cap {
@@ -275,8 +274,8 @@
     <!-- Physics Controls -->
     <div class="row">
       <label for="rMax">Interaction radius</label>
-      <input type="range" id="rMax" min="20" max="400" value="150" step="1">
-      <span class="val" id="rMaxVal">150</span>
+      <input type="range" id="rMax" min="20" max="400" value="30" step="1">
+      <span class="val" id="rMaxVal">30</span>
     </div>
     <div class="row">
       <label for="force">Force scale</label>
@@ -291,6 +290,7 @@
 
     <div class="btns">
       <button id="btnMatrix">Randomize Matrix</button>
+      <button id="btnMasses">Randomize Masses</button>
       <button id="btnReset">Reset Positions</button>
       <button id="btnPause">Pause</button>
     </div>
@@ -318,8 +318,11 @@
 
     // Dynamic Palette Generation (HSL spaced around color wheel)
     let typeColors = [];
-    function generatePalette(count) {
+    let typeMasses = [];
+
+    function generatePaletteAndMasses(count) {
       typeColors = [];
+      typeMasses = [];
       for (let i = 0; i < count; i++) {
         const hue = (i * (360 / count)) % 360;
         // HSL to RGB conversion helper
@@ -333,9 +336,11 @@
         else { r = c; b = x; }
         const m = 0.15;
         typeColors.push([r + m, g + m, b + m]);
+        const randomMass = 0.5 + Math.random() * 9.5;
+        typeMasses.push(parseFloat(randomMass.toFixed(2)));
       }
     }
-    generatePalette(numTypes);
+    generatePaletteAndMasses(numTypes);
 
     const canvas = document.getElementById('gpuCanvas');
 
@@ -387,12 +392,13 @@
     @group(0) @binding(0) var<storage, read_write> particles: array<Particle>;
     @group(0) @binding(1) var<uniform> params: Params;
     @group(0) @binding(2) var<storage, read> matrix: array<f32>;
+    @group(0) @binding(3) var<storage, read> masses: array<f32>;
 
-    /**
+     /**
      * Calculates half-linear particle interactions:
      * Repulsion for short distances (r < beta), attraction/repulsion curve for (beta <= r < 1.0)
      */
-    fn particleForce(r: f32, a: f32) -> f32 {
+      fn particleForce(r: f32, a: f32) -> f32 {
       let beta = 0.3;
       if (r < beta) {
         return r / beta - 1.0;
@@ -414,8 +420,10 @@
       let numTypes = u32(params.numTypes);
       let halfW = params.width * 0.5;
       let halfH = params.height * 0.5;
+      let pType = u32(p.ptype);
+      let pMass = masses[pType];
 
-      // N^2 interaction loop with periodic boundary (toroidal wrap)
+       // N^2 interaction loop with periodic boundary (toroidal wrap)
       for (var j: u32 = 0u; j < n; j = j + 1u) {
         if (j == i) { continue; }
         let q = particles[j];
@@ -432,9 +440,10 @@
         if (dist2 > 0.0001 && dist2 < params.rMax * params.rMax) {
           let dist = sqrt(dist2);
           let r = dist / params.rMax;
+          let qMass = masses[u32(q.ptype)];
           // Look up force matrix coefficient: matrix[row * numTypes + col]
-          let a = matrix[u32(p.ptype) * numTypes + u32(q.ptype)];
-          let f = particleForce(r, a);
+          let a = matrix[pType * numTypes + u32(q.ptype)];
+          let f = particleForce(r, a) * qMass;
           fx = fx + (dx / dist) * f;
           fy = fy + (dy / dist) * f;
         }
@@ -442,8 +451,8 @@
 
       // Apply forces and damp velocity via friction
       var vel = p.vel;
-      vel.x = (vel.x + fx * params.forceScale * params.dt) * params.friction;
-      vel.y = (vel.y + fy * params.forceScale * params.dt) * params.friction;
+      vel.x = (vel.x + (fx / pMass) * params.forceScale * params.dt) * params.friction;
+      vel.y = (vel.y + (fy / pMass) * params.forceScale * params.dt) * params.friction;
       particles[i].vel = vel;
     }
 
@@ -484,6 +493,7 @@
       );
       let corner = corners[vid];
       let p = rParticles[iid];
+      // TODO: Make radius scale with mass
       let radius = 2.6; // Visual particle radius in pixels
       let worldPos = p.pos + corner * radius;
 
@@ -515,6 +525,7 @@
       let particleData, particleBuffer;
       let matrixData, matrixBuffer;
       let colorData, colorBuffer;
+      let massData, massBuffer;
       let computeBindGroup, renderBindGroup;
 
       const paramsData = new Float32Array(8);
@@ -529,6 +540,7 @@
           { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
           { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
           { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+          { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
         ]
       });
       const renderBGL = device.createBindGroupLayout({
@@ -569,7 +581,7 @@
        */
       function rebuildBuffers() {
         numParticles = numTypes * perType;
-        generatePalette(numTypes);
+        generatePaletteAndMasses(numTypes);
 
         // 1. Particle Buffer Creation
         particleData = new Float32Array(numParticles * 6); // 6 floats per struct (pos, vel, type, pad)
@@ -603,7 +615,7 @@
         });
         device.queue.writeBuffer(matrixBuffer, 0, matrixData);
 
-        // 3. Color Buffer Creation
+        // 3. Color and Mass Buffer Creation
         colorData = new Float32Array(numTypes * 4);
         typeColors.forEach((c, i) => {
           colorData[i * 4 + 0] = c[0];
@@ -618,6 +630,15 @@
         });
         device.queue.writeBuffer(colorBuffer, 0, colorData);
 
+        massData = new Float32Array(numTypes);
+        typeMasses.forEach((m, i) => { massData[i] = m; });
+        if (massBuffer) massBuffer.destroy();
+        massBuffer = device.createBuffer({
+          size: Math.max(massData.byteLength, 16),
+          usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+        });
+        device.queue.writeBuffer(massBuffer, 0, massData);
+
         // 4. Re-bind GPU resources to Bind Groups
         computeBindGroup = device.createBindGroup({
           layout: computeBGL,
@@ -625,6 +646,7 @@
             { binding: 0, resource: { buffer: particleBuffer } },
             { binding: 1, resource: { buffer: paramsBuffer } },
             { binding: 2, resource: { buffer: matrixBuffer } },
+            { binding: 3, resource: { buffer: massBuffer } },
           ]
         });
         renderBindGroup = device.createBindGroup({
@@ -649,6 +671,16 @@
         }
         device.queue.writeBuffer(matrixBuffer, 0, matrixData);
         renderMatrixUI();
+      }
+
+      function randomizeMasses() {
+        for (let i = 0; i < numTypes; i++) {
+          const randomMass = 0.5 + Math.random() * 9.5;
+          typeMasses[i] = parseFloat(randomMass.toFixed(2));
+          massData[i] = typeMasses[i];
+        }
+        device.queue.writeBuffer(massBuffer, 0, massData);
+        renderLegendUI();
       }
 
       // ==========================================
@@ -698,14 +730,15 @@
           const span = document.createElement('span');
           const icon = document.createElement('i');
           icon.style.background = `rgb(${c[0] * 255 | 0},${c[1] * 255 | 0},${c[2] * 255 | 0})`;
+          const labelText = `Type ${String.fromCharCode(65 + i)} (m: ${typeMasses[i].toFixed(1)})`;
           span.appendChild(icon);
-          span.appendChild(document.createTextNode(`Type ${String.fromCharCode(65 + i)}`));
+          span.appendChild(document.createTextNode(labelText));
           legend.appendChild(span);
         });
       }
 
       // --- Dynamic Sliders & Control Input Listeners ---
-      const state = { rMax: 150, forceScale: 1.0, friction: 0.95, paused: false };
+      const state = { rMax: 30, forceScale: 1.0, friction: 0.95, paused: false };
 
       // 1. Number of Particle Types Slider (1-10)
       const numTypesEl = document.getElementById('numTypes');
@@ -739,6 +772,7 @@
       frictionEl.addEventListener('input', () => { state.friction = +frictionEl.value / 100; frictionVal.textContent = state.friction.toFixed(2); });
 
       document.getElementById('btnMatrix').addEventListener('click', randomizeMatrix);
+      document.getElementById('btnMasses').addEventListener('click', randomizeMasses);
       document.getElementById('btnReset').addEventListener('click', () => {
         for (let i = 0; i < numParticles; i++) {
           const o = i * 6;
@@ -780,7 +814,7 @@
           paramsData[0] = canvas.width;
           paramsData[1] = canvas.height;
           paramsData[2] = state.rMax * (canvas.width / (canvas.clientWidth || canvas.width)); // Scale viewport pixels
-          paramsData[3] = 1.0; // Fixed timestep dt multiplier
+          paramsData[3] = 1.0;
           paramsData[4] = state.friction;
           paramsData[5] = state.forceScale;
           paramsData[6] = numParticles;
