@@ -3,7 +3,7 @@
 
 <head>
   <meta charset="UTF-8">
-  <title>Particle Life — WebGPU</title>
+  <title>Particle Zoo — WebGPU</title>
   <style>
     :root {
       --bg: #08080c;
@@ -50,6 +50,7 @@
       display: flex;
       flex-direction: column;
       gap: 2px;
+      z-index: 10;
     }
 
     #hud .title {
@@ -248,9 +249,20 @@
 
   <!-- Top Left Heads Up Display -->
   <div id="hud">
-    <div class="title">PARTICLE LIFE</div>
+    <div class="title">PARTICLE ZOO</div>
     <div>fps <b id="fps">--</b></div>
     <div>particles <b id="hudParticles">6,000</b> · types <b id="hudTypes">3</b></div>
+    <div>temp <b id="hudTemp">0.00</b></div>
+    <!-- Real-time Type Distribution Pie Chart -->
+    <div id="pieWrap">
+      <svg id="pieGraph" viewBox="0 0 42 42">
+        <!-- Dark placeholder background ring -->
+        <circle cx="21" cy="21" r="15.91549430918954" fill="transparent" stroke="#1f1f2e" stroke-width="6" />
+      </svg>
+      <div id="pieLegend">
+        <span style="color: var(--text-dim);">Initializing...</span>
+      </div>
+    </div>
   </div>
 
   <!-- Control Panel -->
@@ -274,8 +286,8 @@
     <!-- Physics Controls -->
     <div class="row">
       <label for="rMax">Interaction radius</label>
-      <input type="range" id="rMax" min="20" max="400" value="30" step="1">
-      <span class="val" id="rMaxVal">30</span>
+      <input type="range" id="rMax" min="20" max="400" value="150" step="1">
+      <span class="val" id="rMaxVal">150</span>
     </div>
     <div class="row">
       <label for="force">Force scale</label>
@@ -283,9 +295,9 @@
       <span class="val" id="forceVal">1.00</span>
     </div>
     <div class="row">
-      <label for="friction">Drag</label>
-      <input type="range" id="friction" min="80" max="100" value="95" step="1">
-      <span class="val" id="frictionVal">0.95</span>
+      <label for="friction">Friction</label>
+      <input type="range" id="friction" min="0" max="100" value="5" step="1">
+      <span class="val" id="frictionVal">0.05</span>
     </div>
 
     <div class="btns">
@@ -351,6 +363,110 @@
       window.addEventListener('resize', resize);
 
       // ==========================================
+      // Async GPU Data Readback for Pie Chart
+      // ==========================================
+      let readbackBuffer = null;
+      let lastPieUpdate = 0;
+      let isMapping = false; // Prevents overlapping mapAsync calls
+
+      function createReadbackBuffer() {
+        if (readbackBuffer) readbackBuffer.destroy();
+        readbackBuffer = device.createBuffer({
+          size: particleData.byteLength,
+          usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+        });
+      }
+
+      async function updatePieChart(t) {
+        // Rate-limit updates to every 400ms and ensure previous readback finished
+        if (t - lastPieUpdate < 400 || isMapping || !readbackBuffer) return;
+        lastPieUpdate = t;
+        isMapping = true;
+
+        // Calculate temperature of ensemble
+        try {
+          const commandEncoder = device.createCommandEncoder();
+          commandEncoder.copyBufferToBuffer(particleBuffer, 0, readbackBuffer, 0, particleData.byteLength);
+          device.queue.submit([commandEncoder.finish()]);
+
+          await readbackBuffer.mapAsync(GPUMapMode.READ);
+          const arrayBuffer = readbackBuffer.getMappedRange();
+          const readData = new Float32Array(arrayBuffer);
+
+          const counts = new Array(numTypes).fill(0);
+          let totalKineticEnergy = 0;
+
+          for (let i = 0; i < numParticles; i++) {
+            const o = i * 6;
+            const vx = readData[o + 2];
+            const vy = readData[o + 3];
+            const pType = Math.min(Math.max(0, Math.floor(readData[o + 4] + 0.5)), numTypes - 1);
+
+            counts[pType]++;
+
+            // Fetch mass of particle type (falls back to 1.0 if mass array isn't populated)
+            const m = (typeof typeMasses !== 'undefined' && typeMasses[pType]) ? typeMasses[pType] : 1.0;
+
+            // Accumulate Kinetic Energy: 0.5 * m * (vx^2 + vy^2)
+            totalKineticEnergy += 0.5 * m * (vx * vx + vy * vy);
+          }
+          readbackBuffer.unmap();
+
+          // 2D Ensemble Temperature: T = Total KE / N
+          const systemTemp = totalKineticEnergy / numParticles;
+
+          // Update HUD element
+          const tempEl = document.getElementById('hudTemp');
+          if (tempEl) tempEl.textContent = systemTemp.toFixed(2);
+
+          // Render SVG Pie Chart
+          const svg = document.getElementById('pieGraph');
+          const legend = document.getElementById('pieLegend');
+
+          // Base dark background ring
+          svg.innerHTML = '<circle cx="21" cy="21" r="15.91549430918954" fill="transparent" stroke="#1f1f2e" stroke-width="6" />';
+          legend.innerHTML = '';
+
+          let cumulativePercent = 0;
+
+          for (let i = 0; i < numTypes; i++) {
+            const fraction = counts[i] / numParticles;
+            const percent = fraction * 100;
+
+            // Skip 0% slices
+            if (percent > 0) {
+              const color = typeColors[i];
+              const rgbStr = `rgb(${color[0] * 255 | 0},${color[1] * 255 | 0},${color[2] * 255 | 0})`;
+
+              const circle = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+              circle.setAttribute('cx', '21');
+              circle.setAttribute('cy', '21');
+              circle.setAttribute('r', '15.91549430918954');
+              circle.setAttribute('fill', 'transparent');
+              circle.setAttribute('stroke', rgbStr);
+              circle.setAttribute('stroke-width', '6');
+              circle.setAttribute('stroke-dasharray', `${percent} ${100 - percent}`);
+              circle.setAttribute('stroke-dashoffset', `${-cumulativePercent}`);
+              svg.appendChild(circle);
+
+              cumulativePercent += percent;
+
+              // Add legend entry
+              const row = document.createElement('div');
+              row.style.color = rgbStr;
+              row.textContent = `Type ${String.fromCharCode(65 + i)}: ${percent.toFixed(1)}%`;
+              legend.appendChild(row);
+            }
+          }
+
+        } catch (err) {
+          console.warn("GPU Readback warning:", err);
+        } finally {
+          isMapping = false;
+        }
+      }
+
+      // ==========================================
       // WGSL SHADERS (Compute & Render Pipeline)
       // ==========================================
       const shaderCode = /* wgsl */`
@@ -372,8 +488,8 @@
       numTypes: f32,
       seed: f32,
       enableDecay: f32, // 1.0 = active decay, 0.0 = decay disabled
-      _pad1: f32,
-      _pad2: f32,
+      fusionThreshold: f32, // Relative velocity threshold for kinetic fusion (in pixels/sec)
+      fusionDistance: f32,  // Distance threshold for kinetic fusion (in pixels)
     };
 
     @group(0) @binding(0) var<storage, read_write> particles: array<Particle>;
@@ -439,8 +555,8 @@
 
       // Apply forces and damp velocity via friction
       var vel = p.vel;
-      vel.x = (vel.x + (fx / pMass) * params.forceScale * params.dt) * params.friction;
-      vel.y = (vel.y + (fy / pMass) * params.forceScale * params.dt) * params.friction;
+      vel.x = (vel.x + (fx / pMass) * params.forceScale * params.dt) * (1-params.friction);
+      vel.y = (vel.y + (fy / pMass) * params.forceScale * params.dt) * (1-params.friction);
       particles[i].vel = vel;
     }
 
@@ -479,37 +595,101 @@
 
     @compute @workgroup_size(64)
     fn updateDecay(@builtin(global_invocation_id) gid: vec3u) {
-      // If decay is globally toggled off, exit immediately
       if (params.enableDecay < 0.5) { return; }  
 
       let i = gid.x;
       if (i >= u32(params.numParticles)) { return; }
 
-      let pType = u32(particles[i].ptype);
-      
-      // Ground state (0) is stable
-      if (pType == 0u) { return; }
+      var p = particles[i];
+      let pType = u32(p.ptype);
+      let numTypes = u32(params.numTypes);
+      let maxType = numTypes - 1u;
+      let halfW = params.width * 0.5;
+      let halfH = params.height * 0.5;
 
-      // Decrement lifetime remaining
-      var tLeft = particles[i].lifetime - params.dt;
+      var tLeft = p.lifetime - params.dt;
 
-      if (tLeft <= 0.0) {
-        // 1. Decay down to lower energy state
-        let nextType = pType - 1u;
-        particles[i].ptype = f32(nextType);
+      // --- 1. KINETIC FUSION (Symmetric thread-safe proximity check) ---
+      if (pType < maxType) {
+        for (var j = 0u; j < u32(params.numParticles); j = j + 1u) {
+          if (j == i) { continue; }
+          let q = particles[j];
+          
+          // Calculate wrapped toroidal distance
+          var dx = q.pos.x - p.pos.x;
+          var dy = q.pos.y - p.pos.y;
+          if (dx > halfW) { dx = dx - params.width; }
+          else if (dx < -halfW) { dx = dx + params.width; }
+          if (dy > halfH) { dy = dy - params.height; }
+          else if (dy < -halfH) { dy = dy + params.height; }
 
-        // 2. Roll next lifetime for the new state if it's still unstable
-        if (nextType > 0u) {
-          let lambda = decayRates[nextType];
-          // Seed using global invocation ID and uniform seed step
-          let u = clamp(hashFloat(i + u32(params.seed)), 1e-6, 0.999999);
-          tLeft = -log(1.0 - u) / lambda;
-        } else {
-          tLeft = 1e9; // Ground state lives forever
+          let dist2 = dx * dx + dy * dy;
+
+          // Fusion distance check
+          if (dist2 < params.fusionDistance * params.fusionDistance) {
+            let relVel = length(p.vel - q.vel);
+            
+            // Check relative velocity threshold
+            if (relVel > params.fusionThreshold) {
+              // Rule: The particle with LOWER type gets upgraded
+              let qType = u32(q.ptype);
+              if (pType <= qType) {
+                let nextType = pType + 1u;
+                p.ptype = f32(nextType);
+                
+                // Apply kinetic damping / momentum conservation to self
+                let mP = masses[pType];
+                let mQ = masses[qType];
+                let deltaVel = q.vel * (mQ / (mP + mQ));
+                p.vel = p.vel * 0.5 + deltaVel * 0.5;
+
+                // Re-roll lifetime for upgraded state
+                let lambda = decayRates[nextType];
+                let u = clamp(hashFloat(i + u32(params.seed)), 1e-6, 0.999999);
+                tLeft = select(1e9, -log(1.0 - u) / lambda, lambda > 0.0);
+                break;
+              }
+            }
+          }
         }
       }
 
-      particles[i].lifetime = tLeft;
+      // --- 2. MULTI-STEP FISSION / DECAY ---
+      if (tLeft <= 0.0) {
+        if (pType > 0u) {
+          // 1. Pick a decay target. Heavy particles can split deeply (e.g. down to ground state 0)
+          // Roll a random float between 0.0 and 1.0
+          let randTarget = hashFloat(i + u32(params.seed) + 42u);
+          
+          // Choose a target type strictly lower than pType
+          // Squaring randTarget biases decays toward lower ground states (deep fission)
+          let nextType = u32(floor(randTarget * randTarget * f32(pType)));
+
+          let oldMass = masses[pType];
+          let newMass = masses[nextType];
+          p.ptype = f32(nextType);
+
+          // 2. Mass-energy conversion: larger deltaMass creates high-velocity escape kicks
+          let deltaMass = max(0.5, oldMass - newMass);
+          let randomAngle = hashFloat(i + u32(params.seed) * 17u) * 6.2831853;
+          let kickDir = vec2f(cos(randomAngle), sin(randomAngle));
+          
+          // High kinetic impulse boost (adjust multiplier as needed)
+          let kickSpeed = 40.0 * sqrt(deltaMass); 
+          p.vel = p.vel + kickDir * kickSpeed;
+
+          // 3. Reset lifetime for the new lower state
+          let lambda = decayRates[nextType];
+          let u = clamp(hashFloat(i + u32(params.seed) + 1337u), 1e-6, 0.999999);
+          tLeft = select(1e9, -log(1.0 - u) / lambda, lambda > 0.0);
+        } else {
+          tLeft = 1e9; // Ground state is stable
+        }
+      }
+
+      // Write modified local particle state back to storage buffer
+      p.lifetime = tLeft;
+      particles[i] = p;
     }
 
     @group(0) @binding(0) var<storage, read> rParticles: array<Particle>;
@@ -528,7 +708,7 @@
 
       const MIN_RADIUS: f32 = 1.5;
       const MAX_RADIUS: f32 = 10.0;
-      const MIN_MASS: f32 = 0.5;
+      const MIN_MASS: f32 = 0.1;
       const MAX_MASS: f32 = 10.0;
 
       let typeIdx = u32(p.ptype);
@@ -638,12 +818,17 @@
         const minMass = typeMasses[0];
         const maxMass = typeMasses[numTypes - 1];
 
+        const minLambda = 0.0005;
+        const maxLambda = 0.0100;
+
         for (let i = 0; i < numTypes; i++) {
           if (i === 0 || maxMass === minMass) {
-            typeDecayRates.push(0.0);
+            typeDecayRates.push(0.0); // Lightest/base type is stable
           } else {
-            const normExcess = (typeMasses[i] - minMass) / (maxMass - minMass);
-            const lambda = 0.005 + normExcess * 0.045;
+            const norm = (typeMasses[i] - minMass) / (maxMass - minMass);
+
+            // Exponential interpolation across order of magnitude
+            const lambda = minLambda * Math.pow(maxLambda / minLambda, norm);
             typeDecayRates.push(lambda);
           }
         }
@@ -715,7 +900,8 @@
         if (particleBuffer) particleBuffer.destroy();
         particleBuffer = device.createBuffer({
           size: particleData.byteLength,
-          usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+          // CRITICAL: COPY_SRC must be enabled to copy particleBuffer -> readbackBuffer
+          usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
         });
         device.queue.writeBuffer(particleBuffer, 0, particleData);
 
@@ -767,6 +953,8 @@
           usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
         });
         device.queue.writeBuffer(decayBuffer, 0, decayRates);
+
+        createReadbackBuffer(); // for pie chart readback 
 
         // 4. Re-bind GPU resources to Bind Groups
         computeBindGroup = device.createBindGroup({
@@ -872,7 +1060,7 @@
       }
 
       // --- Dynamic Sliders & Control Input Listeners ---
-      const state = { rMax: 30, forceScale: 1.0, friction: 0.95, paused: false };
+      const state = { rMax: 150, forceScale: 1.0, friction: 0.05, paused: false };
 
       const numTypesEl = document.getElementById('numTypes');
       const numTypesVal = document.getElementById('numTypesVal');
@@ -940,7 +1128,7 @@
       const fpsEl = document.getElementById('fps');
 
       function frame(t) {
-        const dt = Math.min((t - lastT) / 1000, 1 / 30);
+        const dt = Math.min((t - lastT) / 100, 1 / 30);
         lastT = t;
         frames++; fpsAcc += dt;
         if (fpsAcc >= 0.5) {
@@ -959,6 +1147,8 @@
           paramsData[7] = numTypes;
           paramsData[8] = Math.random() * 10000.0;
           paramsData[9] = state.enableDecay ? 1.0 : 0.0;
+          paramsData[10] = 100.0; // fusionThreshold (relative speed in px/s)
+          paramsData[11] = 15.0; // fusionDistance (collision radius in px)
           device.queue.writeBuffer(paramsBuffer, 0, paramsData);
 
           const encoder = device.createCommandEncoder();
@@ -990,6 +1180,10 @@
 
           device.queue.submit([encoder.finish()]);
         }
+
+
+        updatePieChart(t);
+
 
         requestAnimationFrame(frame);
       }
