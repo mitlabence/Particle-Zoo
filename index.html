@@ -298,7 +298,7 @@
     </div>
     <div class="row">
       <label for="force">Force scale</label>
-      <input type="range" id="force" min="0" max="500" value="100" step="1">
+      <input type="range" id="force" min="0" max="1000" value="100" step="1">
       <span class="val" id="forceVal">1.00</span>
     </div>
     <div class="row">
@@ -355,7 +355,7 @@
         DEFAULT_NUM_TYPES: 5,
         DEFAULT_PER_TYPE: 1000,
         RMAX: 150,
-        FORCE_SCALE: 100,
+        FORCE_SCALE: 1.00, // 100%
         FRICTION: 0.05,
         FUSION_THRESHOLD: 750.0, // Relative velocity threshold for kinetic fusion (in pixels/sec)
         FUSION_DISTANCE: 15.0,  // Distance threshold for kinetic fusion (in pixels)
@@ -535,6 +535,7 @@
      * Calculates half-linear particle interactions:
      * Repulsion for short distances (r < beta), attraction/repulsion curve for (beta <= r < 1.0)
      */
+    // TODO: other interaction types?
       fn particleForce(r: f32, a: f32) -> f32 {
       let beta = 0.3;
       if (r < beta) {
