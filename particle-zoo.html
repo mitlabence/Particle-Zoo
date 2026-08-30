@@ -67,8 +67,9 @@
 
     #panel {
       position: absolute;
-      bottom: 16px;
-      left: 16px;
+      bottom: auto;
+      top: 16px;
+      right: 16px;
       width: 380px;
       max-height: calc(100vh - 32px);
       overflow-y: auto;
@@ -272,18 +273,24 @@
     <!-- Particle Config Controls -->
     <div class="row">
       <label for="numTypes">Particle types</label>
-      <input type="range" id="numTypes" min="1" max="10" value="3" step="1">
-      <span class="val" id="numTypesVal">3</span>
+      <input type="range" id="numTypes" min="1" max="10" value="5" step="1">
+      <span class="val" id="numTypesVal">5</span>
     </div>
     <div class="row">
       <label for="perType">Particles / type</label>
-      <input type="range" id="perType" min="1000" max="5000" value="2000" step="1000">
-      <span class="val" id="perTypeVal">2000</span>
+      <input type="range" id="perType" min="1000" max="10000" value="1000" step="500">
+      <span class="val" id="perTypeVal">1000</span>
     </div>
 
     <hr style="border:none; border-top:1px solid #1a1a26; margin:10px 0;">
 
     <!-- Physics Controls -->
+    <div class="row">
+      <label for="timeScaleSlider">
+        Sim Speed: <span id="timeScaleVal">1.0x</span>
+      </label>
+      <input type="range" id="timeScaleSlider" min="0.1" max="10.0" step="0.1" value="1.0" />
+    </div>
     <div class="row">
       <label for="rMax">Interaction radius</label>
       <input type="range" id="rMax" min="20" max="400" value="150" step="1">
@@ -291,7 +298,7 @@
     </div>
     <div class="row">
       <label for="force">Force scale</label>
-      <input type="range" id="force" min="0" max="300" value="100" step="1">
+      <input type="range" id="force" min="0" max="500" value="100" step="1">
       <span class="val" id="forceVal">1.00</span>
     </div>
     <div class="row">
@@ -325,11 +332,37 @@
   </div>
 
   <script type="module">
-    /**
-     * Global Simulation Configuration Parameters
-     */
-    let numTypes = 3;
-    let perType = 2000;
+    // --- CENTRAL SIMULATION CONFIGURATION ---
+    const CONFIG = {
+      // Mass Parameters
+      MASS: {
+        MIN: 0.5,
+        MAX: 25.0,
+      },
+
+      // Decay Rate Parameters
+      DECAY: {
+        MIN_LAMBDA_RANGE: [0.0005, 0.0010], // [min, max] for random generation
+        MAX_LAMBDA_RANGE: [0.0200, 0.0800],
+        CURVE_POWER_RANGE: [1.2, 3.5],
+        NOISE_RANGE: [0.9, 1.1],
+        MIN_STEP: 0.0001,
+      },
+
+      // World Defaults
+      WORLD: {
+        // TODO: these need to agree with default value of sliders in HTML. Better solution: generate sliders from this config object?
+        DEFAULT_NUM_TYPES: 5,
+        DEFAULT_PER_TYPE: 1000,
+        RMAX: 150,
+        FORCE_SCALE: 100,
+        FRICTION: 0.05,
+        FUSION_THRESHOLD: 750.0, // Relative velocity threshold for kinetic fusion (in pixels/sec)
+        FUSION_DISTANCE: 15.0,  // Distance threshold for kinetic fusion (in pixels)
+      }
+    };
+    let numTypes = CONFIG.WORLD.DEFAULT_NUM_TYPES;
+    let perType = CONFIG.WORLD.DEFAULT_PER_TYPE;
     let numParticles = numTypes * perType;
 
     // Dynamic Palette Generation (HSL spaced around color wheel)
@@ -609,7 +642,9 @@
 
       var tLeft = p.lifetime - params.dt;
 
-      // --- 1. KINETIC FUSION (Symmetric thread-safe proximity check) ---
+      // FIXME: kinetic fusion: relative velocity does not take into account the time speed-up factor, so at high timeScale values, more likely to trigger fusion.
+      // --- 1. KINETIC FUSION: kinetic energy of one particle fuels "upgrade" of another (in proximity) into higher mass state
+      // (Symmetric thread-safe proximity check) ---
       if (pType < maxType) {
         for (var j = 0u; j < u32(params.numParticles); j = j + 1u) {
           if (j == i) { continue; }
@@ -634,7 +669,16 @@
               // Rule: The particle with LOWER type gets upgraded
               let qType = u32(q.ptype);
               if (pType <= qType) {
-                let nextType = pType + 1u;
+                // step up into random particle type
+                //let nextType = pType + 1u;
+                // Roll a random float between 0.0 and 1.0
+                let randTarget = hashFloat(i + u32(params.seed) + 42u);
+                // Power-law transformation: mapping r^n biases values strongly toward 0.0 (unlikely multiple jumps in particle hierarchy)
+                let biasedRandTarget = pow(randTarget, 5.0);
+                let availableTiers = f32(maxType - pType);
+                let stepUp = 1u + u32(floor(biasedRandTarget * availableTiers));
+                let nextType = min(maxType, pType + stepUp);
+
                 p.ptype = f32(nextType);
                 
                 // Apply kinetic damping / momentum conservation to self
@@ -816,19 +860,29 @@
         // 2. Recalculate Decay Rates (λ)
         typeDecayRates = [];
         const minMass = typeMasses[0];
-        const maxMass = typeMasses[numTypes - 1];
+        const maxMass = typeMasses[typeMasses.length - 1];
+        const [minL_low, minL_high] = CONFIG.DECAY.MIN_LAMBDA_RANGE;
+        const [maxL_low, maxL_high] = CONFIG.DECAY.MAX_LAMBDA_RANGE;
+        const [powerMin, powerMax] = CONFIG.DECAY.CURVE_POWER_RANGE;
+        const [noiseMin, noiseMax] = CONFIG.DECAY.NOISE_RANGE;
 
-        const minLambda = 0.0005;
-        const maxLambda = 0.0100;
+
+        const minLambda = minL_low + Math.random() * (minL_high - minL_low);
+        const maxLambda = maxL_low + Math.random() * (maxL_high - maxL_low);
+        const curvePower = powerMin + Math.random() * (powerMax - powerMin);
 
         for (let i = 0; i < numTypes; i++) {
           if (i === 0 || maxMass === minMass) {
             typeDecayRates.push(0.0); // Lightest/base type is stable
           } else {
             const norm = (typeMasses[i] - minMass) / (maxMass - minMass);
-
+            // Bias the normalization with random curve power
+            const biasedNorm = Math.pow(norm, curvePower);
             // Exponential interpolation across order of magnitude
-            const lambda = minLambda * Math.pow(maxLambda / minLambda, norm);
+            let lambda = minLambda * Math.pow(maxLambda / minLambda, biasedNorm);
+            // Add some noise to the decay rate
+            const noise = noiseMin + Math.random() * (noiseMax - noiseMin);
+            lambda *= noise;
             typeDecayRates.push(lambda);
           }
         }
@@ -1048,19 +1102,56 @@
       function renderLegendUI() {
         const legend = document.getElementById('legend');
         legend.innerHTML = '';
+
+        // Get active speed multiplier
+        const speed = state.timeScale || 1.0;
+
+        // Container styling for a compact, readable grid/table
+        legend.style.display = 'flex';
+        legend.style.flexDirection = 'column';
+        legend.style.gap = '6px';
+        legend.style.marginTop = '12px';
+
         typeColors.forEach((c, i) => {
-          const span = document.createElement('span');
-          const icon = document.createElement('i');
-          icon.style.background = `rgb(${c[0] * 255 | 0},${c[1] * 255 | 0},${c[2] * 255 | 0})`;
-          const labelText = `Type ${String.fromCharCode(65 + i)} (m: ${typeMasses[i].toFixed(1)})`;
-          span.appendChild(icon);
-          span.appendChild(document.createTextNode(labelText));
-          legend.appendChild(span);
+          const row = document.createElement('div');
+          row.className = 'type-card';
+          row.style.cssText = `
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      background: #14141d;
+      border: 1px solid var(--panel-border);
+      border-radius: 6px;
+      padding: 6px 10px;
+      font-size: 11px;
+    `;
+
+          const rgbStr = `rgb(${c[0] * 255 | 0},${c[1] * 255 | 0},${c[2] * 255 | 0})`;
+          const mass = typeMasses[i] !== undefined ? typeMasses[i].toFixed(2) : '1.00';
+          const lambda = typeDecayRates[i] !== undefined ? typeDecayRates[i] : 0;
+
+          // Calculate half-life tau (t1/2) for intuitive physical meaning
+          const halfLife = lambda > 0 ? (0.693 / (lambda * speed)).toFixed(0) + 's' : '∞';
+          const lambdaText = lambda > 0 ? lambda.toFixed(4) : '0.0000 (stable)';
+
+          row.innerHTML = `
+      <div style="display: flex; align-items: center; gap: 8px;">
+        <i style="width: 10px; height: 10px; border-radius: 50%; background: ${rgbStr}; display: inline-block; flex-shrink: 0;"></i>
+        <span style="font-weight: 600; color: var(--text);">Type ${String.fromCharCode(65 + i)}</span>
+      </div>
+      <div style="display: flex; gap: 12px; font-variant-numeric: tabular-nums;">
+        <span style="color: var(--text-dim);">m: <b style="color: var(--accent);">${mass}</b></span>
+        <span style="color: var(--text-dim);">&lambda;: <b style="color: var(--text);">${lambdaText}</b></span>
+        <span style="color: var(--text-dim);">&tau;<sub>&frac12; eff</sub>: <b style="color: #ffb74d;">${halfLife}</b></span>
+      </div>
+    `;
+
+          legend.appendChild(row);
         });
       }
 
       // --- Dynamic Sliders & Control Input Listeners ---
-      const state = { rMax: 150, forceScale: 1.0, friction: 0.05, paused: false };
+      const state = { rMax: CONFIG.WORLD.RMAX, forceScale: CONFIG.WORLD.FORCE_SCALE, friction: CONFIG.WORLD.FRICTION, fusionThreshold: CONFIG.WORLD.FUSION_THRESHOLD, fusionDistance: CONFIG.WORLD.FUSION_DISTANCE, paused: false };
 
       const numTypesEl = document.getElementById('numTypes');
       const numTypesVal = document.getElementById('numTypesVal');
@@ -1076,6 +1167,19 @@
         perType = parseInt(perTypeEl.value, 10);
         perTypeVal.textContent = perType;
         rebuildBuffers();
+      });
+
+
+      state.timeScale = 1.0;
+      const speedSlider = document.getElementById('timeScaleSlider');
+      const speedVal = document.getElementById('timeScaleVal');
+      speedSlider.addEventListener('input', (e) => {
+        const val = parseFloat(e.target.value);
+        state.timeScale = val;
+        speedVal.textContent = val.toFixed(1) + 'x';
+
+        // Recalculate UI legend to reflect effective wall-clock half-life
+        renderLegendUI();
       });
 
       const rMaxEl = document.getElementById('rMax');
@@ -1128,7 +1232,9 @@
       const fpsEl = document.getElementById('fps');
 
       function frame(t) {
-        const dt = Math.min((t - lastT) / 100, 1 / 30);
+        const rawDt = Math.min((t - lastT) / 1000, 1 / 30);
+        // Compute effective dt scaled by speed multiplier
+        const dt = rawDt * state.timeScale;
         lastT = t;
         frames++; fpsAcc += dt;
         if (fpsAcc >= 0.5) {
@@ -1137,18 +1243,35 @@
         }
 
         if (!state.paused) {
+
+          /*
+          struct Params {
+            width: f32,
+            height: f32,
+            rMax: f32,
+            dt: f32,
+            friction: f32,
+            forceScale: f32,
+            numParticles: f32,
+            numTypes: f32,
+            seed: f32,
+            enableDecay: f32, // 1.0 = active decay, 0.0 = decay disabled
+            fusionThreshold: f32, // Relative velocity threshold for kinetic fusion (in pixels/sec)
+            fusionDistance: f32,  // Distance threshold for kinetic fusion (in pixels)
+          };
+          */
           paramsData[0] = canvas.width;
           paramsData[1] = canvas.height;
           paramsData[2] = state.rMax * (canvas.width / (canvas.clientWidth || canvas.width));
-          paramsData[3] = 5 * dt;
+          paramsData[3] = dt;
           paramsData[4] = state.friction;
           paramsData[5] = state.forceScale;
           paramsData[6] = numParticles;
           paramsData[7] = numTypes;
           paramsData[8] = Math.random() * 10000.0;
           paramsData[9] = state.enableDecay ? 1.0 : 0.0;
-          paramsData[10] = 100.0; // fusionThreshold (relative speed in px/s)
-          paramsData[11] = 15.0; // fusionDistance (collision radius in px)
+          paramsData[10] = state.fusionThreshold; // fusionThreshold (relative speed in px/s)
+          paramsData[11] = state.fusionDistance; // fusionDistance (collision radius in px)
           device.queue.writeBuffer(paramsBuffer, 0, paramsData);
 
           const encoder = device.createCommandEncoder();
