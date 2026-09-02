@@ -24,3 +24,7 @@ The following parameters can be controlled:
   - Dampens velocity and stabilizes motion. A higher value leads to more dynamic systems (and possibly runaway kinetic fusion), while a lower value leads to more static, geometric patterns (where the optional fission dominates). 
 - Turn decay on/off
   - Enable change of particle types by introducing "kinetic fusion" (two particles close by with enough relative speed can trigger the sacrifice of kinetic energy to propel the lighter of them into a higher-mass state)‚ and fission (spontaneous decay with the converted mass changing into velocity, characterized by the type-specific lambda parameter, randomly generated).
+
+  ## Development
+
+  Note: cross-origin request blocking requires a server; for example, use Live Server extension in VS Code.
