@@ -29,3 +29,17 @@ export const CONFIG = {
 };
 
 export const state = { rMax: CONFIG.WORLD.RMAX, forceScale: CONFIG.WORLD.FORCE_SCALE, friction: CONFIG.WORLD.FRICTION, fusionThreshold: CONFIG.WORLD.FUSION_THRESHOLD, fusionDistance: CONFIG.WORLD.FUSION_DISTANCE, paused: false };
+
+/**
+ * The canvas is sized in device pixels (canvas.width/height), but rMax comes
+ * from a slider calibrated in CSS pixels. This scales rMax into device-pixel
+ * space using the same ratio applied to the physics uniform in loop.js.
+ *
+ * IMPORTANT: this is the single source of truth for "effective rMax" - both
+ * the spatial grid dimensions (buffers.js) and the Params.rMax uniform sent
+ * to the GPU (loop.js) must use this same value, or the grid the shader
+ * walks won't match the grid the CPU allocated for it.
+ */
+export function getEffectiveRMax(canvas) {
+  return state.rMax * (canvas.width / (canvas.clientWidth || canvas.width));
+}

@@ -3,6 +3,7 @@
 // the "randomize" and "reset" actions exposed by the control panel.
 
 import { App } from './app.js';
+import { state, getEffectiveRMax } from './config.js';
 import { generatePaletteAndMasses, sortAndSyncMassHierarchy, sampleLifetime } from './palette.js';
 import { renderMatrixUI, renderLegendUI } from './ui/render.js';
 
@@ -15,11 +16,94 @@ export function createReadbackBuffer() {
 }
 
 /**
+ * Grid resolution for the current canvas size + rMax. Uses the same
+ * device-pixel-scaled rMax that gets sent to the shader (see
+ * config.js:getEffectiveRMax) so the CPU-allocated grid and the grid the
+ * shader walks always agree on dimensions.
+ */
+export function computeGridDims() {
+  const rMax = getEffectiveRMax(App.canvas);
+  const gridWidth = Math.max(1, Math.ceil(App.canvas.width / rMax));
+  const gridHeight = Math.max(1, Math.ceil(App.canvas.height / rMax));
+  return { gridWidth, gridHeight, totalCells: gridWidth * gridHeight };
+}
+
+/**
+ * (Re)allocates the uniform-grid buffers whose size depends on grid
+ * resolution (cellCounts / cellOffsets), whenever rMax or the canvas size
+ * changes. sortedIndices is allocated in rebuildBuffers() instead, since
+ * its size depends on particle count, not grid resolution.
+ * Returns true if a reallocation happened (caller must rebuild the bind
+ * group referencing these buffers).
+ */
+export function ensureGridBuffers() {
+  const { device } = App;
+  const { gridWidth, gridHeight, totalCells } = computeGridDims();
+
+  if (totalCells === App.totalCells && App.cellCountsBuffer && App.cellOffsetsBuffer) {
+    return false; // grid resolution unchanged, nothing to do
+  }
+
+  App.gridWidth = gridWidth;
+  App.gridHeight = gridHeight;
+  App.totalCells = totalCells;
+
+  if (App.cellCountsBuffer) App.cellCountsBuffer.destroy();
+  App.cellCountsBuffer = device.createBuffer({
+    size: totalCells * 4, // atomic<u32> per cell
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+  });
+  // Reused every frame to clear cellCounts before the grid rebuild passes.
+  App.zeroCellCounts = new Uint32Array(totalCells);
+
+  if (App.cellOffsetsBuffer) App.cellOffsetsBuffer.destroy();
+  App.cellOffsetsBuffer = device.createBuffer({
+    size: totalCells * 4, // u32 per cell
+    usage: GPUBufferUsage.STORAGE,
+  });
+
+  return true;
+}
+
+/**
+ * Recreates App.computeBindGroup from whatever buffers currently live on
+ * App. Call this any time one of the bound buffers has been reallocated
+ * (particle count changed, or the grid was resized).
+ */
+function rebuildComputeBindGroup() {
+  App.computeBindGroup = App.device.createBindGroup({
+    layout: App.computeBGL,
+    entries: [
+      { binding: 0, resource: { buffer: App.particleBuffer } },
+      { binding: 1, resource: { buffer: App.paramsBuffer } },
+      { binding: 2, resource: { buffer: App.matrixBuffer } },
+      { binding: 3, resource: { buffer: App.massBuffer } },
+      { binding: 4, resource: { buffer: App.decayBuffer } },
+      { binding: 5, resource: { buffer: App.cellCountsBuffer } },
+      { binding: 6, resource: { buffer: App.cellOffsetsBuffer } },
+      { binding: 7, resource: { buffer: App.sortedIndicesBuffer } },
+    ]
+  });
+}
+
+/**
+ * Called once per frame from the render loop. Re-syncs the grid buffers if
+ * rMax or canvas size changed since the last frame (e.g. window resize, or
+ * the "Interaction radius" slider), and rebuilds the compute bind group if
+ * so. Cheap no-op most frames.
+ */
+export function syncGridIfNeeded() {
+  if (ensureGridBuffers()) {
+    rebuildComputeBindGroup();
+  }
+}
+
+/**
  * (Re)initializes all GPU memory buffers based on current numTypes/perType,
  * and rebuilds the bind groups + UI that depend on them.
  */
 export function rebuildBuffers() {
-  const { device, canvas, computeBGL, renderBGL } = App;
+  const { device, canvas, renderBGL } = App;
   App.numParticles = App.numTypes * App.perType;
   generatePaletteAndMasses(App.numTypes);
 
@@ -94,19 +178,22 @@ export function rebuildBuffers() {
   });
   device.queue.writeBuffer(App.decayBuffer, 0, App.decayRates);
 
+  // 4. Sorted-indices buffer: one u32 slot per particle, filled in by the
+  // scatterGrid compute pass every frame. Sized by particle count, so it's
+  // rebuilt here rather than in ensureGridBuffers().
+  if (App.sortedIndicesBuffer) App.sortedIndicesBuffer.destroy();
+  App.sortedIndicesBuffer = device.createBuffer({
+    size: App.numParticles * 4,
+    usage: GPUBufferUsage.STORAGE,
+  });
+
+  // 5. Grid buffers (cellCounts / cellOffsets) sized by grid resolution.
+  ensureGridBuffers();
+
   createReadbackBuffer(); // for pie chart readback
 
-  // 4. Re-bind GPU resources to Bind Groups
-  App.computeBindGroup = device.createBindGroup({
-    layout: computeBGL,
-    entries: [
-      { binding: 0, resource: { buffer: App.particleBuffer } },
-      { binding: 1, resource: { buffer: App.paramsBuffer } },
-      { binding: 2, resource: { buffer: App.matrixBuffer } },
-      { binding: 3, resource: { buffer: App.massBuffer } },
-      { binding: 4, resource: { buffer: App.decayBuffer } },
-    ]
-  });
+  // 6. Re-bind GPU resources to Bind Groups
+  rebuildComputeBindGroup();
   App.renderBindGroup = device.createBindGroup({
     layout: renderBGL,
     entries: [

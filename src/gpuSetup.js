@@ -51,6 +51,13 @@ export async function initGPU(canvas) {
       { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
       { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
       { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+      // Uniform grid buffers (neighbor search). All three need read_write
+      // (i.e. 'storage', not 'read-only-storage') because different passes
+      // in the count -> prefix sum -> scatter -> force pipeline write to
+      // them - even though a single pass like updateVelocity only reads.
+      { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }, // cellCounts (atomic)
+      { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }, // cellOffsets
+      { binding: 7, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }, // sortedIndices
     ]
   });
   App.renderBGL = App.device.createBindGroupLayout({
@@ -63,16 +70,33 @@ export async function initGPU(canvas) {
   });
 
   // Pipelines
+  const computeLayout = App.device.createPipelineLayout({ bindGroupLayouts: [App.computeBGL] });
+
+  // Grid rebuild pipeline (runs once per frame, before the physics passes)
+  App.countGridPipeline = App.device.createComputePipeline({
+    layout: computeLayout,
+    compute: { module: computeModule, entryPoint: 'countGrid' }
+  });
+  App.prefixSumPipeline = App.device.createComputePipeline({
+    layout: computeLayout,
+    compute: { module: computeModule, entryPoint: 'prefixSum' }
+  });
+  App.scatterGridPipeline = App.device.createComputePipeline({
+    layout: computeLayout,
+    compute: { module: computeModule, entryPoint: 'scatterGrid' }
+  });
+
+  // Physics pipelines
   App.velPipeline = App.device.createComputePipeline({
-    layout: App.device.createPipelineLayout({ bindGroupLayouts: [App.computeBGL] }),
+    layout: computeLayout,
     compute: { module: computeModule, entryPoint: 'updateVelocity' }
   });
   App.posPipeline = App.device.createComputePipeline({
-    layout: App.device.createPipelineLayout({ bindGroupLayouts: [App.computeBGL] }),
+    layout: computeLayout,
     compute: { module: computeModule, entryPoint: 'updatePosition' }
   });
   App.decayPipeline = App.device.createComputePipeline({
-    layout: App.device.createPipelineLayout({ bindGroupLayouts: [App.computeBGL] }),
+    layout: computeLayout,
     compute: { module: computeModule, entryPoint: 'updateDecay' }
   });
   App.renderPipeline = App.device.createRenderPipeline({

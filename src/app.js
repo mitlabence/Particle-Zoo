@@ -4,6 +4,8 @@
 // instead of relying on closures, so responsibilities can live in separate
 // files without a tangle of function arguments.
 
+const paramsArrayBuffer = new ArrayBuffer(64); // 64 bytes total
+
 export const App = {
   // Canvas / GPU core
   canvas: null,
@@ -36,11 +38,34 @@ export const App = {
   decayBuffer: null,
   readbackBuffer: null,
   paramsBuffer: null,
-  paramsData: new Float32Array(12),
+  // Shared 64-byte views for Params Uniforms (u32 and f32)
+  paramsData: new Float32Array(paramsArrayBuffer),
+  paramsUint: new Uint32Array(paramsArrayBuffer),
+
+  // --- Uniform spatial grid (neighbor search) ---
+  // Resolution of the grid, recomputed whenever rMax or the canvas size
+  // changes (see buffers.js: computeGridDims / ensureGridBuffers).
+  gridWidth: 0,
+  gridHeight: 0,
+  totalCells: 0,
+  // atomic<u32> per cell: particle count (built each frame by countGrid,
+  // consumed as write-cursor by scatterGrid, read as neighbor count by
+  // updateVelocity).
+  cellCountsBuffer: null,
+  // u32 per cell: start index of that cell's range inside sortedIndices,
+  // computed once per frame by the single-threaded prefixSum pass.
+  cellOffsetsBuffer: null,
+  // u32 per particle: particle indices grouped contiguously by cell.
+  sortedIndicesBuffer: null,
+  // Cached zeroed array used to clear cellCountsBuffer every frame.
+  zeroCellCounts: null,
 
   // Bind group layouts / pipelines (created once in gpuSetup.js)
   computeBGL: null,
   renderBGL: null,
+  countGridPipeline: null,
+  prefixSumPipeline: null,
+  scatterGridPipeline: null,
   velPipeline: null,
   posPipeline: null,
   decayPipeline: null,

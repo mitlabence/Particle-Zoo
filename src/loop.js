@@ -1,9 +1,10 @@
 // src/loop.js
-// The per-frame compute + render dispatch, plus FPS bookkeeping and the
-// (rate-limited) pie chart readback trigger.
+// The per-frame grid rebuild + compute + render dispatch, plus FPS
+// bookkeeping and the (rate-limited) pie chart readback trigger.
 
 import { App } from './app.js';
-import { state } from './config.js';
+import { state, getEffectiveRMax } from './config.js';
+import { syncGridIfNeeded } from './buffers.js';
 import { updatePieChart } from './pieChart.js';
 
 export function startLoop() {
@@ -15,54 +16,71 @@ export function startLoop() {
     // Compute effective dt scaled by speed multiplier
     const dt = rawDt * state.timeScale;
     App.lastT = t;
-    App.frames++; App.fpsAcc += dt;
+    App.frames++; 
+    App.fpsAcc += rawDt;
     if (App.fpsAcc >= 0.5) {
-      fpsEl.textContent = Math.round(App.frames / App.fpsAcc);
-      App.frames = 0; App.fpsAcc = 0;
+      if (fpsEl) fpsEl.textContent = Math.round(App.frames / App.fpsAcc);
+      App.frames = 0; 
+      App.fpsAcc = 0;
     }
 
     if (!state.paused) {
       const {
-        canvas, device, paramsData, paramsBuffer, computeBindGroup, renderBindGroup,
+        canvas, device, paramsData, paramsUint, paramsBuffer, computeBindGroup, renderBindGroup,
+        countGridPipeline, prefixSumPipeline, scatterGridPipeline,
         velPipeline, posPipeline, decayPipeline, renderPipeline, context,
         numParticles, numTypes
       } = App;
 
-      /*
-      struct Params {
-        width: f32,
-        height: f32,
-        rMax: f32,
-        dt: f32,
-        friction: f32,
-        forceScale: f32,
-        numParticles: f32,
-        numTypes: f32,
-        seed: f32,
-        enableDecay: f32, // 1.0 = active decay, 0.0 = decay disabled
-        fusionThreshold: f32, // Relative velocity threshold for kinetic fusion (in pixels/sec)
-        fusionDistance: f32,  // Distance threshold for kinetic fusion (in pixels)
-      };
-      */
-      paramsData[0] = canvas.width;
-      paramsData[1] = canvas.height;
-      paramsData[2] = state.rMax * (canvas.width / (canvas.clientWidth || canvas.width));
-      paramsData[3] = dt;
-      paramsData[4] = state.friction;
-      paramsData[5] = state.forceScale;
-      paramsData[6] = numParticles;
-      paramsData[7] = numTypes;
-      paramsData[8] = Math.random() * 10000.0;
-      paramsData[9] = state.enableDecay ? 1.0 : 0.0;
-      paramsData[10] = state.fusionThreshold; // fusionThreshold (relative speed in px/s)
-      paramsData[11] = state.fusionDistance; // fusionDistance (collision radius in px)
+      // Re-allocate the grid buffers if rMax or canvas size changed since
+      // last frame (also runs the first time, allocating them initially).
+      syncGridIfNeeded();
+
+      const effRMax = getEffectiveRMax(canvas);
+
+      // u32: gridSize.x, gridSize.y (must match what ensureGridBuffers just sized)
+      paramsUint[0] = App.gridWidth;
+      paramsUint[1] = App.gridHeight;
+      // f32: scalars
+      paramsData[2] = canvas.width;
+      paramsData[3] = canvas.height;
+      paramsData[4] = effRMax;
+      paramsData[5] = dt;
+      paramsData[6] = state.friction;
+      paramsData[7] = state.forceScale;
+      // u32: numParticles, numTypes
+      paramsUint[8] = numParticles;
+      paramsUint[9] = numTypes;
+      // f32: remaining parameters & padding
+      paramsData[10] = Math.random() * 10000.0;
+      paramsData[11] = state.enableDecay ? 1.0 : 0.0;
+      paramsData[12] = state.fusionThreshold; // fusionThreshold (relative speed in px/s)
+      paramsData[13] = state.fusionDistance; // fusionDistance (collision radius in px)
+      paramsData[14] = 0.0; // _pad1
+      paramsData[15] = 0.0; // _pad2
+
       device.queue.writeBuffer(paramsBuffer, 0, paramsData);
+      // Clear per-cell counters before rebuilding the grid this frame.
+      device.queue.writeBuffer(App.cellCountsBuffer, 0, App.zeroCellCounts);
 
       const encoder = device.createCommandEncoder();
       const workgroups = Math.ceil(numParticles / 64);
 
       const cpass = encoder.beginComputePass();
       cpass.setBindGroup(0, computeBindGroup);
+
+      // Rebuild the uniform grid: count particles per cell, prefix-sum into
+      // offsets, then scatter particle indices into contiguous per-cell
+      // ranges. Must run before updateVelocity, which reads the result.
+      cpass.setPipeline(countGridPipeline);
+      cpass.dispatchWorkgroups(workgroups);
+      cpass.setPipeline(prefixSumPipeline);
+      cpass.dispatchWorkgroups(1); // single-threaded scan, see physics.wgsl.js
+      cpass.setPipeline(scatterGridPipeline);
+      cpass.dispatchWorkgroups(workgroups);
+
+      // Physics: updateVelocity now only scans neighboring grid cells
+      // instead of every other particle.
       cpass.setPipeline(velPipeline);
       cpass.dispatchWorkgroups(workgroups);
       cpass.setPipeline(posPipeline);
