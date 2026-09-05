@@ -177,10 +177,10 @@ fn hashFloat(seed: u32) -> f32 {
     return f32(word) / 4294967296.0;
 }
 
-// NOTE: kinetic fusion below is still an O(N^2) all-pairs scan per particle
-// (unlike updateVelocity, it doesn't use the grid yet). It only runs when
-// decay is enabled and pType < maxType, but it's the next obvious target if
-// decay mode turns out to be the new bottleneck.
+// Kinetic fusion (below) now walks the same uniform grid updateVelocity
+// uses, instead of scanning every other particle. Fission/decay itself
+// (part 2, below) has no neighbor search and was never O(N^2).
+// TODO: kinetic fusion is based on same grid as updateVelocity, but its range is much smaller; for large interaction distance (rMax) and small fusionDistance, this is still O(N^2) in the worst case.
 @compute @workgroup_size(64)
 fn updateDecay(@builtin(global_invocation_id) gid: vec3u) {
     if (params.enableDecay < 0.5) { return; }  
@@ -200,55 +200,87 @@ fn updateDecay(@builtin(global_invocation_id) gid: vec3u) {
     // FIXME: kinetic fusion: relative velocity does not take into account the time speed-up factor, so at high timeScale values, more likely to trigger fusion.
     // --- 1. KINETIC FUSION: kinetic energy of one particle fuels "upgrade" of another (in proximity) into higher mass state
     // (Symmetric thread-safe proximity check) ---
+    // Grid-accelerated: fusionDistance is expected to be well under one grid
+    // cell (rMax) - the UI's rMax minimum (20) already exceeds the default
+    // fusionDistance (15) - so a small neighborhood of cells around p's own
+    // cell is guaranteed to contain every particle within fusion range.
+    // cellRadius widens automatically if fusionDistance is ever tuned past
+    // rMax, instead of silently missing pairs.
+    // NOTE: this reuses the grid built by countGrid/prefixSum/scatterGrid
+    // earlier this frame, from positions *before* updatePosition runs -
+    // updateDecay is dispatched before updatePosition (see loop.js) so the
+    // grid and particle positions stay in sync.
     if (pType < maxType) {
-    for (var j = 0u; j < u32(params.numParticles); j = j + 1u) {
-        if (j == i) { continue; }
-        let q = particles[j];
-        
-        // Calculate wrapped toroidal distance
-        var dx = q.pos.x - p.pos.x;
-        var dy = q.pos.y - p.pos.y;
-        if (dx > halfW) { dx = dx - params.width; }
-        else if (dx < -halfW) { dx = dx + params.width; }
-        if (dy > halfH) { dy = dy - params.height; }
-        else if (dy < -halfH) { dy = dy + params.height; }
+    let cellCoord = getCellCoord(p.pos, params.rMax, params.gridSize);
+    let cellX = i32(cellCoord.x);
+    let cellY = i32(cellCoord.y);
+    let gw = i32(params.gridSize.x);
+    let gh = i32(params.gridSize.y);
+    let cellRadius = max(1, i32(ceil(params.fusionDistance / params.rMax)));
 
-        let dist2 = dx * dx + dy * dy;
+    var fused = false;
+    for (var dy = -cellRadius; dy <= cellRadius; dy++) {
+        if (fused) { break; }
+        for (var dx = -cellRadius; dx <= cellRadius; dx++) {
+            if (fused) { break; }
+            let nx = u32((cellX + dx + gw) % gw);
+            let ny = u32((cellY + dy + gh) % gh);
+            let neighborCellIndex = nx + ny * params.gridSize.x;
+            let startOffset = cellOffsets[neighborCellIndex];
+            let count = atomicLoad(&cellCounts[neighborCellIndex]);
 
-        // Fusion distance check
-        if (dist2 < params.fusionDistance * params.fusionDistance) {
-        let relVel = length(p.vel - q.vel);
-        
-        // Check relative velocity threshold
-        if (relVel > params.fusionThreshold) {
-            // Rule: The particle with LOWER type gets upgraded
-            let qType = u32(q.ptype);
-            if (pType <= qType) {
-            // step up into random particle type
-            //let nextType = pType + 1u;
-            // Roll a random float between 0.0 and 1.0
-            let randTarget = hashFloat(i + u32(params.seed) + 42u);
-            // Power-law transformation: mapping r^n biases values strongly toward 0.0 (unlikely multiple jumps in particle hierarchy)
-            let biasedRandTarget = pow(randTarget, 5.0);
-            let availableTiers = f32(maxType - pType);
-            let stepUp = 1u + u32(floor(biasedRandTarget * availableTiers));
-            let nextType = min(maxType, pType + stepUp);
+            for (var k = 0u; k < count; k = k + 1u) {
+                let j = sortedIndices[startOffset + k];
+                if (j == i) { continue; }
+                let q = particles[j];
 
-            p.ptype = f32(nextType);
-            
-            // Apply kinetic damping / momentum conservation to self
-            let mP = masses[pType];
-            let mQ = masses[qType];
-            let deltaVel = q.vel * (mQ / (mP + mQ));
-            p.vel = p.vel * 0.5 + deltaVel * 0.5;
+                // Calculate wrapped toroidal distance
+                var ddx = q.pos.x - p.pos.x;
+                var ddy = q.pos.y - p.pos.y;
+                if (ddx > halfW) { ddx = ddx - params.width; }
+                else if (ddx < -halfW) { ddx = ddx + params.width; }
+                if (ddy > halfH) { ddy = ddy - params.height; }
+                else if (ddy < -halfH) { ddy = ddy + params.height; }
 
-            // Re-roll lifetime for upgraded state
-            let lambda = decayRates[nextType];
-            let u = clamp(hashFloat(i + u32(params.seed)), 1e-6, 0.999999);
-            tLeft = select(1e9, -log(1.0 - u) / lambda, lambda > 0.0);
-            break;
+                let dist2 = ddx * ddx + ddy * ddy;
+
+                // Fusion distance check
+                if (dist2 < params.fusionDistance * params.fusionDistance) {
+                let relVel = length(p.vel - q.vel);
+
+                // Check relative velocity threshold
+                if (relVel > params.fusionThreshold) {
+                    // Rule: The particle with LOWER type gets upgraded
+                    let qType = u32(q.ptype);
+                    if (pType <= qType) {
+                    // step up into random particle type
+                    //let nextType = pType + 1u;
+                    // Roll a random float between 0.0 and 1.0
+                    let randTarget = hashFloat(i + u32(params.seed) + 42u);
+                    // Power-law transformation: mapping r^n biases values strongly toward 0.0 (unlikely multiple jumps in particle hierarchy)
+                    let biasedRandTarget = pow(randTarget, 5.0);
+                    let availableTiers = f32(maxType - pType);
+                    let stepUp = 1u + u32(floor(biasedRandTarget * availableTiers));
+                    let nextType = min(maxType, pType + stepUp);
+
+                    p.ptype = f32(nextType);
+
+                    // Apply kinetic damping / momentum conservation to self
+                    let mP = masses[pType];
+                    let mQ = masses[qType];
+                    let deltaVel = q.vel * (mQ / (mP + mQ));
+                    p.vel = p.vel * 0.5 + deltaVel * 0.5;
+
+                    // Re-roll lifetime for upgraded state
+                    let lambda = decayRates[nextType];
+                    let u = clamp(hashFloat(i + u32(params.seed)), 1e-6, 0.999999);
+                    tLeft = select(1e9, -log(1.0 - u) / lambda, lambda > 0.0);
+                    fused = true;
+                    break;
+                    }
+                }
+                }
             }
-        }
         }
     }
     }

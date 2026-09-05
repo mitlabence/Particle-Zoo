@@ -79,13 +79,19 @@ export function startLoop() {
       cpass.setPipeline(scatterGridPipeline);
       cpass.dispatchWorkgroups(workgroups);
 
-      // Physics: updateVelocity now only scans neighboring grid cells
-      // instead of every other particle.
+      // Physics: updateVelocity and updateDecay (kinetic fusion) both only
+      // scan neighboring grid cells now instead of every other particle.
+      // decayPipeline runs *before* posPipeline so its neighbor search sees
+      // the same positions the grid above was built from - if it ran after
+      // the position update, particles could have drifted into different
+      // cells than the ones cellOffsets/cellCounts/sortedIndices describe.
+      // Any velocity change from fusion/fission then still gets applied to
+      // this frame's position update, so nothing is lost by the reorder.
       cpass.setPipeline(velPipeline);
       cpass.dispatchWorkgroups(workgroups);
-      cpass.setPipeline(posPipeline);
-      cpass.dispatchWorkgroups(workgroups);
       cpass.setPipeline(decayPipeline);
+      cpass.dispatchWorkgroups(workgroups);
+      cpass.setPipeline(posPipeline);
       cpass.dispatchWorkgroups(workgroups);
       cpass.end();
 
